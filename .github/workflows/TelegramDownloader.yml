@@ -1,0 +1,392 @@
+name: TelegramDownloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_links:
+        description: '🔗 Telegram post links (separate with space)'
+        required: true
+        type: string
+      split_threshold_mb:
+        description: '📦 Maximum file size per part (MB)'
+        required: false
+        type: number
+        default: 90
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 📂 Setup workspace
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Install core tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq zip unzip aria2 bc
+
+      - name: 💾 Load cached proxy
+        id: load_proxy
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "💾 Loading cached proxy list..."
+          echo "═══════════════════════════════════════════════════════════════"
+          
+          mkdir -p .cache
+          CACHED_PROXY=""
+          
+          if [ -f ".cache/working_proxy.txt" ]; then
+            CACHED_PROXY=$(cat .cache/working_proxy.txt)
+            echo "📦 Found cached proxy: $CACHED_PROXY"
+            
+            if curl -s -x "http://$CACHED_PROXY" \
+              --max-time 5 \
+              --connect-timeout 3 \
+              -k \
+              'https://telegramdownloader.net/proxy.php' \
+              -X POST \
+              -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' \
+              --compressed 2>/dev/null | grep -q '"success"'; then
+              
+              echo "✅ Cached proxy is still working!"
+              echo "selected_proxy=$CACHED_PROXY" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ Cached proxy is dead, will search for new one"
+              echo "selected_proxy=" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "ℹ️ No cached proxy found"
+            echo "selected_proxy=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🚀 Proxy discovery (if needed)
+        id: find_proxy
+        if: steps.load_proxy.outputs.selected_proxy == ''
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "🔍 Initializing proxy discovery engine..."
+          echo "═══════════════════════════════════════════════════════════════"
+          
+          curl -s 'https://raw.githubusercontent.com/Ian-Lusule/Proxies/main/proxies/http.txt' 2>/dev/null | \
+            grep -v '^0\.0\.0\.0' | \
+            grep -v '^127\.0\.0\.1' | \
+            head -100 > proxy_list.txt 2>/dev/null
+          
+          SELECTED_PROXY=""
+          TEST_COUNT=0
+          TOTAL_PROXIES=$(wc -l < proxy_list.txt 2>/dev/null)
+          
+          if [ -z "$TOTAL_PROXIES" ] || [ "$TOTAL_PROXIES" -eq 0 ]; then
+            SELECTED_PROXY="DIRECT"
+          else
+            while IFS= read -r proxy_addr; do
+              proxy_addr=$(echo "$proxy_addr" | xargs)
+              [ -z "$proxy_addr" ] && continue
+              
+              TEST_COUNT=$((TEST_COUNT + 1))
+              echo -n "[${TEST_COUNT}/${TOTAL_PROXIES}] Validating ${proxy_addr} ... "
+              
+              if curl -s -x "http://${proxy_addr}" \
+                --max-time 4 \
+                --connect-timeout 2 \
+                -k \
+                'https://telegramdownloader.net/proxy.php' \
+                -X POST \
+                -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' \
+                -H 'Content-Type: application/x-www-form-urlencoded' \
+                --data-raw 'telegram_link=https%3A%2F%2Ft.me%2Ftest' \
+                --compressed 2>/dev/null | grep -q '"success"'; then
+                
+                echo " ✓ ACTIVE"
+                SELECTED_PROXY="$proxy_addr"
+                break
+              else
+                echo " ✗ DEAD"
+              fi
+            done < proxy_list.txt 2>/dev/null
+          fi
+          
+          if [ -z "$SELECTED_PROXY" ]; then
+            SELECTED_PROXY="DIRECT"
+          else
+            mkdir -p .cache
+            echo "$SELECTED_PROXY" > .cache/working_proxy.txt
+            echo "💾 Saved working proxy to cache"
+          fi
+          
+          echo "selected_proxy=$SELECTED_PROXY" >> $GITHUB_OUTPUT
+          echo ""
+          echo "✅ Active proxy: $SELECTED_PROXY"
+
+      - name: Use cached or discovered proxy
+        id: final_proxy
+        run: |
+          if [ -n "${{ steps.load_proxy.outputs.selected_proxy }}" ]; then
+            echo "selected_proxy=${{ steps.load_proxy.outputs.selected_proxy }}" >> $GITHUB_OUTPUT
+            echo "✅ Using cached proxy: ${{ steps.load_proxy.outputs.selected_proxy }}"
+          else
+            echo "selected_proxy=${{ steps.find_proxy.outputs.selected_proxy }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📡 Process each link
+        id: process_all
+        run: |
+          LINKS="${{ github.event.inputs.telegram_links }}"
+          PROXY="${{ steps.final_proxy.outputs.selected_proxy }}"
+          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
+          
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          
+          mkdir -p downloads
+          
+          fix_url() {
+            echo "$1" | sed 's/ /-/g' | sed 's/%20/-/g'
+          }
+          
+          create_safe_folder_name() {
+            echo "$1" | sed 's/[<>:"|?*\\/@#\$%^&!~`+=;,.]/_/g' | sed 's/ /_/g' | sed 's/__*/_/g' | cut -c1-80
+          }
+          
+          sanitize_filename() {
+            echo "$1" | sed 's/%20/-/g' | sed 's/%40/@/g' | sed 's/[[:space:]]/-/g' | sed 's/--*/-/g' | sed 's/[^a-zA-Z0-9.@_-]//g'
+          }
+          
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+          
+          download_one() {
+            local TELEGRAM_LINK="$1"
+            local INDEX="$2"
+            
+            echo ""
+            echo "═══════════════════════════════════════════════════════════════"
+            echo "📥 Processing [$INDEX]: $TELEGRAM_LINK"
+            echo "═══════════════════════════════════════════════════════════════"
+            
+            if [ "$PROXY" = "DIRECT" ]; then
+              RESPONSE=$(curl -s -X POST \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                -H "Accept: */*" \
+                -H "Referer: https://telegramdownloader.net/" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                --data-raw "telegram_link=$TELEGRAM_LINK" \
+                --compressed \
+                https://telegramdownloader.net/proxy.php)
+            else
+              RESPONSE=$(curl -s -x "http://$PROXY" -X POST \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                -H "Accept: */*" \
+                -H "Referer: https://telegramdownloader.net/" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                --data-raw "telegram_link=$TELEGRAM_LINK" \
+                --compressed \
+                https://telegramdownloader.net/proxy.php)
+            fi
+            
+            RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
+            ORIGINAL_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+            
+            if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+              echo "❌ Failed to get download link for $TELEGRAM_LINK"
+              return 1
+            fi
+            
+            FIXED_URL=$(fix_url "$RAW_URL")
+            CLEAN_NAME=$(sanitize_filename "$ORIGINAL_NAME")
+            FOLDER_NAME=$(create_safe_folder_name "${CLEAN_NAME%.*}")
+            DOWNLOAD_PATH="downloads/$FOLDER_NAME"
+            mkdir -p "$DOWNLOAD_PATH"
+            
+            echo "✅ Source acquired: $ORIGINAL_NAME"
+            echo "🧹 Cleaned name: $CLEAN_NAME"
+            echo "📁 Folder: $FOLDER_NAME"
+            echo "📥 Downloading: $ORIGINAL_NAME"
+            
+            aria2c \
+              --max-connection-per-server=4 \
+              --split=4 \
+              --min-split-size=10M \
+              --max-tries=5 \
+              --retry-wait=5 \
+              --timeout=60 \
+              --connect-timeout=30 \
+              --allow-overwrite=true \
+              --auto-file-renaming=false \
+              --summary-interval=1 \
+              --console-log-level=error \
+              --dir="$DOWNLOAD_PATH" \
+              --out="$ORIGINAL_NAME" \
+              "$FIXED_URL"
+            
+            if [ ! -f "$DOWNLOAD_PATH/$ORIGINAL_NAME" ]; then
+              echo "❌ Download failed: $ORIGINAL_NAME"
+              return 1
+            fi
+            
+            if [ "$ORIGINAL_NAME" != "$CLEAN_NAME" ]; then
+              mv "$DOWNLOAD_PATH/$ORIGINAL_NAME" "$DOWNLOAD_PATH/$CLEAN_NAME"
+              echo "🔄 Renamed: $ORIGINAL_NAME → $CLEAN_NAME"
+            fi
+            
+            FILE_SIZE=$(stat -c%s "$DOWNLOAD_PATH/$CLEAN_NAME")
+            
+            if [ "$FILE_SIZE" -lt 10000 ]; then
+              echo "❌ Invalid file (only ${FILE_SIZE} bytes): $CLEAN_NAME"
+              rm "$DOWNLOAD_PATH/$CLEAN_NAME"
+              return 1
+            fi
+            
+            SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+            echo "✅ Downloaded: ${SIZE_MB} MB - $CLEAN_NAME"
+            
+            LIMIT=$((THRESHOLD * 1024 * 1024))
+            SPLIT_FILES=()
+            
+            if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ] && [ "$THRESHOLD" != "0" ]; then
+              echo "✂️ Splitting into ${THRESHOLD}MB parts..."
+              cd "$DOWNLOAD_PATH"
+              zip -s "${THRESHOLD}m" "${CLEAN_NAME}.zip" -j "$CLEAN_NAME"
+              rm "$CLEAN_NAME"
+              
+              if [ -f "${CLEAN_NAME}.zip" ]; then
+                SPLIT_FILES+=("${CLEAN_NAME}.zip")
+              fi
+              
+              for i in $(seq -w 1 99); do
+                PART_FILE="${CLEAN_NAME}.z${i}"
+                if [ -f "$PART_FILE" ]; then
+                  SPLIT_FILES+=("$PART_FILE")
+                else
+                  break
+                fi
+              done
+              cd ../..
+            else
+              SPLIT_FILES=("$CLEAN_NAME")
+            fi
+            
+            GITHUB_LINKS_FILE="$DOWNLOAD_PATH/github_links.txt"
+            ENCODED_FOLDER=$(urlencode "$FOLDER_NAME")
+            
+            > "$GITHUB_LINKS_FILE"
+            for file in "${SPLIT_FILES[@]}"; do
+              ENCODED_FILE=$(urlencode "$file")
+              GITHUB_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${BRANCH}/downloads/${ENCODED_FOLDER}/${ENCODED_FILE}"
+              echo "$GITHUB_LINK" >> "$GITHUB_LINKS_FILE"
+            done
+            
+            echo "📝 GitHub links saved to: $GITHUB_LINKS_FILE"
+            echo "📊 Total split files: ${#SPLIT_FILES[@]}"
+            echo "📋 Links generated:"
+            cat "$GITHUB_LINKS_FILE"
+            
+            return 0
+          }
+          
+          LINK_ARRAY=($LINKS)
+          TOTAL_LINKS=${#LINK_ARRAY[@]}
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+          
+          echo ""
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "📊 Total links to process: $TOTAL_LINKS"
+          echo "═══════════════════════════════════════════════════════════════"
+          
+          for i in "${!LINK_ARRAY[@]}"; do
+            LINK="${LINK_ARRAY[$i]}"
+            INDEX=$((i + 1))
+            
+            if download_one "$LINK" "$INDEX"; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+            
+            if [ $INDEX -lt $TOTAL_LINKS ]; then
+              echo ""
+              echo "⏳ Waiting 3 seconds before next download..."
+              sleep 3
+            fi
+          done
+          
+          echo ""
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "📊 Processing complete!"
+          echo "✅ Successful: $SUCCESS_COUNT"
+          echo "❌ Failed: $FAIL_COUNT"
+          echo "📁 Files saved in: downloads/[file_name_folder]/"
+          echo "📝 Each folder contains: github_links.txt (GitHub download links)"
+          echo "═══════════════════════════════════════════════════════════════"
+          
+          echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "fail_count=$FAIL_COUNT" >> $GITHUB_OUTPUT
+
+      - name: 📤 Deploy to repository
+        run: |
+          git config user.name "TelegramDownloader-bot"
+          git config user.email "telegramdownloader@local"
+          
+          if [ ! -d "downloads" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+            echo "⚠️ No assets to deploy"
+            exit 0
+          fi
+          
+          git fetch origin main
+          git pull origin main --rebase || true
+          
+          git add downloads/ .cache/ 2>/dev/null || true
+          
+          if git diff --cached --quiet; then
+            echo "✅ No new changes to commit"
+            exit 0
+          fi
+          
+          git commit -m "Add downloaded media from Telegram [skip ci]"
+          
+          for attempt in 1 2 3; do
+            if git push origin main 2>&1; then
+              echo "✅ Successfully deployed to repository"
+              break
+            else
+              if [ $attempt -lt 3 ]; then
+                echo "⚠️ Push failed, retry $attempt/3..."
+                git pull origin main --rebase
+                sleep 5
+              else
+                echo "❌ Failed to push after 3 attempts"
+                exit 1
+              fi
+            fi
+          done
+
+      - name: 📋 Download report
+        if: always()
+        run: |
+          echo ""
+          echo "┌─────────────────────────────────────────────────────────────┐"
+          echo "│              Telegram Downloader Summary                  │"
+          echo "├─────────────────────────────────────────────────────────────┤"
+          echo "│ 🔗 Total links: ${{ steps.process_all.outputs.success_count }} succeeded, ${{ steps.process_all.outputs.fail_count }} failed"
+          echo "│ 📁 Location: ./downloads/"
+          echo "│ 📝 Each folder has github_links.txt with GitHub raw download links"
+          echo "│ 🧹 File names are cleaned (no spaces or special chars)"
+          echo "└─────────────────────────────────────────────────────────────┘"
+          
+          echo ""
+          echo "📂 Folder structure:"
+          find downloads -type f -name "github_links.txt" 2>/dev/null | head -10
+          
+          echo ""
+          echo "📄 Sample files:"
+          find downloads -type f ! -name "github_links.txt" 2>/dev/null | head -10
