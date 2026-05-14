@@ -1,0 +1,71 @@
+name: 📥 Telegram Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: "Telegram post link (example: https://t.me/channel/123)"
+        required: true
+        type: string
+
+jobs:
+  tg-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate telegram link
+        run: |
+          LINK="${{ github.event.inputs.telegram_link }}"
+
+          if [[ -z "$LINK" ]]; then
+            echo "❌ Telegram link is empty"
+            exit 1
+          fi
+
+          if [[ ! "$LINK" =~ ^https://t\.me/ ]]; then
+            echo "❌ Invalid telegram link"
+            exit 1
+          fi
+
+          echo "✅ Link accepted: $LINK"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 selenium webdriver-manager
+
+      - name: Show downloader info
+        run: |
+          echo "Telegram Downloader Running..."
+          echo "Input link: ${{ github.event.inputs.telegram_link }}"
+
+      - name: Run downloader
+        run: |
+          python download_telegram.py "${{ github.event.inputs.telegram_link }}"
+
+      - name: Commit downloaded files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git add .
+
+          if git diff --staged --quiet; then
+            echo "⚠️ No files downloaded"
+          else
+            git commit -m "Downloaded: ${{ github.event.inputs.telegram_link }}"
+            git push
+          fi
